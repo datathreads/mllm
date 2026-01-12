@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use eventsource_stream::{Event, Eventsource};
+use futures::TryStreamExt;
 use std::pin::Pin;
 
 use reqwest::{Client, Url};
@@ -7,7 +9,7 @@ use tracing::warn;
 
 use crate::{
     Error, Llm, LlmResponse, LlmTier, LlmUsage,
-    parser::{ResponseStream, SseProtocol, StreamEvent},
+    parser::{ResponseStream, StreamEvent},
 };
 
 // Default OpenAI Models
@@ -76,6 +78,33 @@ impl OpenAiLlm {
     }
 }
 
+async fn openai_event_parsing(event: Event) -> Result<Option<StreamEvent>, Error> {
+    let data = event.data;
+    if data == "[DONE]" {
+        return Ok(None);
+    }
+
+    let event = serde_json::from_str::<CustomStreamEvent>(&data)
+        .inspect_err(|e| {
+            warn!(%data, "Failed to parse OpenAI stream chunk: {e}");
+        })
+        .ok(); // skip malformed events
+
+    match event {
+        Some(CustomStreamEvent::ResponseOutputTextDelta { delta }) => {
+            Ok(Some(StreamEvent::Text(delta)))
+        }
+        Some(CustomStreamEvent::ResponseCompleted {
+            response: CustomResponse { usage, .. },
+        }) => Ok(Some(StreamEvent::Usage(LlmUsage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            cached_tokens: 0,
+        }))),
+        _ => Ok(None),
+    }
+}
+
 #[async_trait]
 impl Llm for OpenAiLlm {
     fn model_for_tier(&self, tier: LlmTier) -> &str {
@@ -112,65 +141,62 @@ impl Llm for OpenAiLlm {
             .await?
             .error_for_status()?;
 
-        let stream = ResponseStream::new(
-            Box::pin(response.bytes_stream()),
-            SseProtocol::new(parse_openai_stream_event),
-        );
+        let event_stream = response
+            .bytes_stream()
+            .eventsource()
+            .map_err(Error::from)
+            .try_filter_map(openai_event_parsing);
+
+        let stream = ResponseStream::new(Box::pin(event_stream));
 
         Ok(Box::pin(stream) as Pin<Box<dyn LlmResponse>>)
-    }
-}
-
-fn parse_openai_stream_event(_event: &str, data: &str) -> Option<StreamEvent> {
-    let event = serde_json::from_str::<CustomStreamEvent>(data)
-        .inspect_err(|e| {
-            warn!(%data, "Failed to parse OpenAI stream chunk: {e}");
-        })
-        .ok()?;
-    match event {
-        CustomStreamEvent::ResponseOutputTextDelta { delta } => Some(StreamEvent::Text(delta)),
-        CustomStreamEvent::ResponseCompleted {
-            response: CustomResponse { usage, .. },
-        } => Some(StreamEvent::Usage(LlmUsage {
-            prompt_tokens: usage.input_tokens,
-            completion_tokens: usage.output_tokens,
-            cached_tokens: 0,
-        })),
-        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eventsource_stream::Event;
 
-    #[test]
-    fn test_parse_openai_text_delta() {
-        let data = r#"{
-            "type": "response.output_text.delta",
-            "delta": "Hello"
-        }"#;
-        let event = parse_openai_stream_event("", data).unwrap();
-        if let StreamEvent::Text(t) = event {
+    #[tokio::test]
+    async fn test_openai_event_parsing_text_delta() {
+        let event = Event {
+            id: "".to_string(),
+            event: "".to_string(),
+            data: r#"{
+                "type": "response.output_text.delta",
+                "delta": "Hello"
+            }"#
+            .to_string(),
+            retry: None,
+        };
+        let result = openai_event_parsing(event).await.unwrap().unwrap();
+        if let StreamEvent::Text(t) = result {
             assert_eq!(t, "Hello");
         } else {
             panic!("Expected text");
         }
     }
 
-    #[test]
-    fn test_parse_openai_completed() {
-        let data = r#"{
-            "type": "response.completed",
-            "response": {
-                "usage": {
-                    "input_tokens": 10,
-                    "output_tokens": 20
+    #[tokio::test]
+    async fn test_openai_event_parsing_completed() {
+        let event = Event {
+            id: "".to_string(),
+            event: "".to_string(),
+            data: r#"{
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20
+                    }
                 }
-            }
-        }"#;
-        let event = parse_openai_stream_event("", data).unwrap();
-        if let StreamEvent::Usage(u) = event {
+            }"#
+            .to_string(),
+            retry: None,
+        };
+        let result = openai_event_parsing(event).await.unwrap().unwrap();
+        if let StreamEvent::Usage(u) = result {
             assert_eq!(u.prompt_tokens, 10);
             assert_eq!(u.completion_tokens, 20);
         } else {

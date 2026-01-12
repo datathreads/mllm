@@ -6,19 +6,20 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
-use thiserror::Error;
 
 pub mod claude;
 pub mod gemini;
 pub mod openai;
 mod parser;
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Llm error: {0}")]
     LlmUnexpected(String),
     #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error("EventStream error: {0}")]
+    EventStream(#[from] eventsource_stream::EventStreamError<reqwest::Error>),
     #[error("Json error: {0}")]
     Json(#[from] serde_json::Error),
 }

@@ -1,13 +1,15 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use eventsource_stream::{Event, Eventsource};
+use futures::TryStreamExt;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
     Error, Llm, LlmResponse, LlmTier, LlmUsage,
-    parser::{ResponseStream, SseProtocol, StreamEvent},
+    parser::{ResponseStream, StreamEvent},
 };
 
 // Claude Models
@@ -99,6 +101,47 @@ impl ClaudeLlm {
     }
 }
 
+async fn claude_event_parsing(event: Event) -> Result<Option<StreamEvent>, Error> {
+    let event_type = event.event;
+    let data = event.data;
+
+    match event_type.as_str() {
+        "message_start" => {
+            let parsed = serde_json::from_str::<ClaudeMessageStart>(&data)
+                .inspect_err(|e| warn!(%data, "Failed to parse message_start: {e}"))
+                .ok();
+            Ok(parsed.map(|ClaudeMessageStart { message }| {
+                StreamEvent::Usage(LlmUsage {
+                    prompt_tokens: message.usage.input_tokens,
+                    completion_tokens: 0,
+                    cached_tokens: 0,
+                })
+            }))
+        }
+        "content_block_delta" => {
+            let parsed = serde_json::from_str::<ClaudeContentDelta>(&data)
+                .inspect_err(|e| warn!(%data, "Failed to parse content_block_delta: {e}"))
+                .ok();
+            Ok(parsed.map(|ClaudeContentDelta { delta }| StreamEvent::Text(delta.text)))
+        }
+        "message_delta" => {
+            let parsed = serde_json::from_str::<ClaudeMessageDelta>(&data)
+                .inspect_err(|e| warn!(%data, "Failed to parse message_delta: {e}"))
+                .ok();
+            Ok(parsed.map(|ClaudeMessageDelta { delta }| {
+                StreamEvent::Usage(LlmUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: delta.usage.output_tokens,
+                    cached_tokens: 0,
+                })
+            }))
+        }
+        // Handled by stream ending
+        "message_stop" => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 #[async_trait]
 impl Llm for ClaudeLlm {
     fn model_for_tier(&self, tier: LlmTier) -> &str {
@@ -143,84 +186,67 @@ impl Llm for ClaudeLlm {
             .send()
             .await?
             .error_for_status()?;
+        let event_stream = response
+            .bytes_stream()
+            .eventsource()
+            .map_err(Error::from)
+            .try_filter_map(claude_event_parsing);
 
-        let stream = ResponseStream::new(
-            Box::pin(response.bytes_stream()),
-            SseProtocol::new(parse_claude_stream_event),
-        );
+        let stream = ResponseStream::new(Box::pin(event_stream));
 
         Ok(Box::pin(stream) as Pin<Box<dyn LlmResponse>>)
-    }
-}
-
-fn parse_claude_stream_event(event: &str, data: &str) -> Option<StreamEvent> {
-    match event {
-        "message_start" => serde_json::from_str::<ClaudeMessageStart>(data)
-            .inspect_err(|e| warn!(%data, "Failed to parse message_start: {e}"))
-            .ok()
-            .map(|ClaudeMessageStart { message }| {
-                StreamEvent::Usage(LlmUsage {
-                    prompt_tokens: message.usage.input_tokens,
-                    completion_tokens: 0,
-                    cached_tokens: 0,
-                })
-            }),
-        "content_block_delta" => serde_json::from_str::<ClaudeContentDelta>(data)
-            .inspect_err(|e| warn!(%data, "Failed to parse content_block_delta: {e}"))
-            .ok()
-            .map(|ClaudeContentDelta { delta }| StreamEvent::Text(delta.text)),
-        "message_delta" => serde_json::from_str::<ClaudeMessageDelta>(data)
-            .inspect_err(|e| warn!(%data, "Failed to parse message_delta: {e}"))
-            .ok()
-            .map(|ClaudeMessageDelta { delta }| {
-                StreamEvent::Usage(LlmUsage {
-                    prompt_tokens: 0,
-                    completion_tokens: delta.usage.output_tokens,
-                    cached_tokens: 0,
-                })
-            }),
-        // Handled by stream ending
-        "message_stop" => None,
-        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eventsource_stream::Event;
 
-    #[test]
-    fn test_parse_claude_content_delta() {
-        let data = r#"{
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "text_delta", "text": "Hello" }
-        }"#;
-        let event = parse_claude_stream_event("content_block_delta", data).unwrap();
-        if let StreamEvent::Text(t) = event {
+    #[tokio::test]
+    async fn test_claude_event_parsing_content_delta() {
+        let event = Event {
+            id: "".to_string(),
+            event: "content_block_delta".to_string(),
+            data: r#"{
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "Hello" }
+            }"#
+            .to_string(),
+            retry: None,
+        };
+        let result = claude_event_parsing(event).await.unwrap().unwrap();
+        if let StreamEvent::Text(t) = result {
             assert_eq!(t, "Hello");
         } else {
             panic!("Expected text");
         }
     }
 
-    #[test]
-    fn test_parse_claude_message_start_usage() {
-        let data = r#"{
-            "type": "message_start",
-            "message": {
-                "id": "msg_1",
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": "claude-3",
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": { "input_tokens": 25, "output_tokens": 1 }
-            }
-        }"#;
-        let event = parse_claude_stream_event("message_start", data).unwrap();
-        if let StreamEvent::Usage(u) = event {
+    #[tokio::test]
+    async fn test_claude_event_parsing_message_start_usage() {
+        let event = Event {
+            id: "".to_string(),
+            event: "message_start".to_string(),
+            data: r#"{
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-3",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 25, "output_tokens": 1 }
+                }
+            }"#
+            .to_string(),
+            retry: None,
+        };
+        let result = claude_event_parsing(event).await.unwrap().unwrap();
+        if let StreamEvent::Usage(u) = result {
             assert_eq!(u.prompt_tokens, 25);
             assert_eq!(u.completion_tokens, 0);
         } else {

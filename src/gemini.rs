@@ -1,13 +1,14 @@
 use std::{ops::AddAssign, pin::Pin};
 
 use async_trait::async_trait;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
+use futures::Stream;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Error, Llm, LlmResponse, LlmTier, LlmUsage,
-    parser::{LlmProtocol, ResponseStream, StreamEvent},
+    parser::{ResponseStream, StreamEvent},
 };
 
 // Gemini Models
@@ -94,61 +95,97 @@ struct GeminiPartResponse {
     text: String,
 }
 
-#[derive(Default)]
-pub struct GeminiProtocol {
+struct GeminiEventStream {
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    buffer: BytesMut,
     pending_usage: Option<LlmUsage>,
 }
 
-impl LlmProtocol for GeminiProtocol {
-    fn decode(&mut self, buffer: &mut BytesMut) -> Result<Option<StreamEvent>, Error> {
-        if let Some(usage) = self.pending_usage.take() {
-            return Ok(Some(StreamEvent::Usage(usage)));
+impl GeminiEventStream {
+    fn new(stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>) -> Self {
+        Self {
+            stream,
+            buffer: BytesMut::new(),
+            pending_usage: None,
         }
+    }
+}
 
-        if buffer.is_empty() {
-            return Ok(None);
-        }
+impl Stream for GeminiEventStream {
+    type Item = Result<StreamEvent, Error>;
 
-        let mut deserializer =
-            serde_json::Deserializer::from_slice(buffer).into_iter::<Vec<GeminiApiResponse>>();
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            // 1. DRAIN: Check if we have pending usage to emit
+            if let Some(usage) = self.pending_usage.take() {
+                return std::task::Poll::Ready(Some(Ok(StreamEvent::Usage(usage))));
+            }
 
-        match deserializer.next() {
-            Some(Ok(api_responses)) => {
-                let offset = deserializer.byte_offset();
-                let mut text = String::new();
-                let mut usage = LlmUsage::default();
+            // 2. PROCESS: Try to parse data from the buffer
+            if !self.buffer.is_empty() {
+                let mut deserializer = serde_json::Deserializer::from_slice(&self.buffer)
+                    .into_iter::<Vec<GeminiApiResponse>>();
 
-                for response in api_responses {
-                    if let Some(candidate) = response.candidates.into_iter().next()
-                        && let Some(part) = candidate.content.parts.into_iter().next()
-                    {
-                        text.push_str(&part.text);
+                match deserializer.next() {
+                    Some(Ok(api_responses)) => {
+                        let offset = deserializer.byte_offset();
+                        let mut text = String::new();
+                        let mut usage = LlmUsage::default();
+
+                        for response in api_responses {
+                            if let Some(candidate) = response.candidates.into_iter().next()
+                                && let Some(part) = candidate.content.parts.into_iter().next()
+                            {
+                                text.push_str(&part.text);
+                            }
+                            usage.prompt_tokens += response.usage_metadata.prompt_token_count;
+                            usage.completion_tokens +=
+                                response.usage_metadata.candidates_token_count;
+                            usage.cached_tokens +=
+                                response.usage_metadata.cached_content_token_count;
+                        }
+
+                        self.buffer.advance(offset);
+
+                        if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                            self.pending_usage = Some(usage);
+                        }
+
+                        if !text.is_empty() {
+                            return std::task::Poll::Ready(Some(Ok(StreamEvent::Text(text))));
+                        } else if let Some(usage) = self.pending_usage.take() {
+                            return std::task::Poll::Ready(Some(Ok(StreamEvent::Usage(usage))));
+                        }
                     }
-                    usage.prompt_tokens += response.usage_metadata.prompt_token_count;
-                    usage.completion_tokens += response.usage_metadata.candidates_token_count;
-                    usage.cached_tokens += response.usage_metadata.cached_content_token_count;
-                }
-
-                buffer.advance(offset);
-
-                if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
-                    self.pending_usage = Some(usage);
-                }
-
-                if !text.is_empty() {
-                    Ok(Some(StreamEvent::Text(text)))
-                } else if let Some(usage) = self.pending_usage.take() {
-                    Ok(Some(StreamEvent::Usage(usage)))
-                } else {
-                    Ok(None)
+                    Some(Err(e)) if !e.is_eof() => {
+                        // Malformed JSON (or start of array `[` that we can't parse as Vec yet without ending `]`)
+                        self.buffer.clear();
+                        return std::task::Poll::Ready(Some(Err(Error::Json(e))));
+                    }
+                    _ => {
+                        // Need more data, continue
+                    }
                 }
             }
-            Some(Err(e)) if e.is_eof() => Ok(None),
-            Some(Err(e)) => {
-                buffer.clear();
-                Err(e.into())
+
+            // 3. FILL: Read more bytes
+            match self.stream.as_mut().poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    continue; // Loop back to try parsing
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(Error::from(e))));
+                }
+                std::task::Poll::Ready(None) => {
+                    // Check buffer one last time? Usually EOF error handles it.
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
-            None => Ok(None),
         }
     }
 }
@@ -235,8 +272,8 @@ impl Llm for GeminiLlm {
             .await?
             .error_for_status()?;
 
-        let stream =
-            ResponseStream::new(Box::pin(response.bytes_stream()), GeminiProtocol::default());
+        let adapter = GeminiEventStream::new(Box::pin(response.bytes_stream()));
+        let stream = ResponseStream::new(Box::pin(adapter));
 
         Ok(Box::pin(stream))
     }
@@ -244,29 +281,29 @@ impl Llm for GeminiLlm {
 
 #[cfg(test)]
 mod tests {
+    use futures::{StreamExt, stream};
+
     use super::*;
 
-    #[test]
-    fn test_gemini_protocol_full_array() {
-        let mut protocol = GeminiProtocol::default();
+    #[tokio::test]
+    async fn test_gemini_event_stream_full_array() {
         let json = r#"[
             {
                 "candidates": [{ "content": { "parts": [{ "text": "Hello" }] } }],
                 "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
             }
         ]"#;
-        let mut buffer = BytesMut::from(json);
+        let stream = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(json))]);
+        let mut event_stream = GeminiEventStream::new(Box::pin(stream));
 
-        // First decode should return text
-        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        let event = event_stream.next().await.unwrap().unwrap();
         if let StreamEvent::Text(t) = event {
             assert_eq!(t, "Hello");
         } else {
             panic!("Expected text");
         }
 
-        // Second decode should return usage (from pending_usage)
-        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        let event = event_stream.next().await.unwrap().unwrap();
         if let StreamEvent::Usage(u) = event {
             assert_eq!(u.prompt_tokens, 10);
             assert_eq!(u.completion_tokens, 5);
@@ -274,27 +311,34 @@ mod tests {
             panic!("Expected usage");
         }
 
-        assert!(protocol.decode(&mut buffer).unwrap().is_none());
+        assert!(event_stream.next().await.is_none());
     }
 
-    #[test]
-    fn test_gemini_protocol_fragmented() {
-        let mut protocol = GeminiProtocol::default();
+    #[tokio::test]
+    async fn test_gemini_event_stream_fragmented() {
         let part1 = r#"[ { "candidates": [ { "content": { "parts": [ { "text": "Part1" "#;
-        let mut buffer = BytesMut::from(part1);
-
-        // Should return None due to EOF
-        assert!(protocol.decode(&mut buffer).unwrap().is_none());
-
-        // Append rest
         let part2 = r#"} ] } } ] , "usageMetadata": { "promptTokenCount": 1 } } ]"#;
-        buffer.extend_from_slice(part2.as_bytes());
 
-        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        let stream = stream::iter(vec![
+            Ok::<_, reqwest::Error>(Bytes::from(part1)),
+            Ok::<_, reqwest::Error>(Bytes::from(part2)),
+        ]);
+        let mut event_stream = GeminiEventStream::new(Box::pin(stream));
+
+        let event = event_stream.next().await.unwrap().unwrap();
         if let StreamEvent::Text(t) = event {
             assert_eq!(t, "Part1");
         } else {
             panic!("Expected text");
         }
+
+        let event = event_stream.next().await.unwrap().unwrap();
+        if let StreamEvent::Usage(u) = event {
+            assert_eq!(u.prompt_tokens, 1);
+        } else {
+            panic!("Expected usage");
+        }
+
+        assert!(event_stream.next().await.is_none());
     }
 }

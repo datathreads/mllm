@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 bytes = "1.11.0"
+eventsource-stream = "0.2.3"
 futures = "0.3.31"
 reqwest = { version = "0.13.1", features = ["json", "stream"] }
 schemars = "1.2.0"
