@@ -54,10 +54,11 @@ struct CustomResponse {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,no_run
+/// # use reqwest::Client;
+/// # use mllm::openai::OpenAiLlm;
 /// let client = Client::new();
-/// let openai_api_key = std::env::var("OPENAI_API_KEY").unwrap();
-/// let llm = OpenAiLlm::new(client, openai_api_key, None);
+/// let llm = OpenAiLlm::new(client, "api-key".to_string(), None);
 /// ```
 pub struct OpenAiLlm {
     client: Client,
@@ -113,28 +114,67 @@ impl Llm for OpenAiLlm {
 
         let stream = ResponseStream::new(
             Box::pin(response.bytes_stream()),
-            SseProtocol::new(|_event: &str, data: &str| {
-                let event = serde_json::from_str::<CustomStreamEvent>(data)
-                    .inspect_err(|e| {
-                        warn!(%data, "Failed to parse OpenAI stream chunk: {e}");
-                    })
-                    .ok()?;
-                match event {
-                    CustomStreamEvent::ResponseOutputTextDelta { delta } => {
-                        Some(StreamEvent::Text(delta))
-                    }
-                    CustomStreamEvent::ResponseCompleted {
-                        response: CustomResponse { usage, .. },
-                    } => Some(StreamEvent::Usage(LlmUsage {
-                        prompt_tokens: usage.input_tokens,
-                        completion_tokens: usage.output_tokens,
-                        cached_tokens: 0,
-                    })),
-                    _ => None,
-                }
-            }),
+            SseProtocol::new(parse_openai_stream_event),
         );
 
         Ok(Box::pin(stream) as Pin<Box<dyn LlmResponse>>)
+    }
+}
+
+fn parse_openai_stream_event(_event: &str, data: &str) -> Option<StreamEvent> {
+    let event = serde_json::from_str::<CustomStreamEvent>(data)
+        .inspect_err(|e| {
+            warn!(%data, "Failed to parse OpenAI stream chunk: {e}");
+        })
+        .ok()?;
+    match event {
+        CustomStreamEvent::ResponseOutputTextDelta { delta } => Some(StreamEvent::Text(delta)),
+        CustomStreamEvent::ResponseCompleted {
+            response: CustomResponse { usage, .. },
+        } => Some(StreamEvent::Usage(LlmUsage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            cached_tokens: 0,
+        })),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_openai_text_delta() {
+        let data = r#"{
+            "type": "response.output_text.delta",
+            "delta": "Hello"
+        }"#;
+        let event = parse_openai_stream_event("", data).unwrap();
+        if let StreamEvent::Text(t) = event {
+            assert_eq!(t, "Hello");
+        } else {
+            panic!("Expected text");
+        }
+    }
+
+    #[test]
+    fn test_parse_openai_completed() {
+        let data = r#"{
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20
+                }
+            }
+        }"#;
+        let event = parse_openai_stream_event("", data).unwrap();
+        if let StreamEvent::Usage(u) = event {
+            assert_eq!(u.prompt_tokens, 10);
+            assert_eq!(u.completion_tokens, 20);
+        } else {
+            panic!("Expected usage");
+        }
     }
 }

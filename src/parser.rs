@@ -297,19 +297,31 @@ impl<P: LlmProtocol> Stream for ResponseStream<P> {
 impl<P: LlmProtocol> LlmResponse for ResponseStream<P> {}
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::stream;
 
-    struct DummyProtocol;
-    impl LlmProtocol for DummyProtocol {
-        fn decode(&mut self, _buffer: &mut BytesMut) -> Result<Option<StreamEvent>, Error> {
-            Ok(None)
-        }
+    fn create_test_protocol() -> SseProtocol<impl Fn(&str, &str) -> Option<StreamEvent>> {
+        SseProtocol::new(|event, data| {
+            if event == "message" {
+                Some(StreamEvent::Text(data.to_string()))
+            } else if event == "usage" {
+                let parts: Vec<&str> = data.split(',').collect();
+                Some(StreamEvent::Usage(LlmUsage {
+                    prompt_tokens: parts[0].parse().unwrap_or(0),
+                    completion_tokens: parts[1].parse().unwrap_or(0),
+                    cached_tokens: 0,
+                }))
+            } else {
+                None
+            }
+        })
     }
 
-    fn create_test_stream() -> ResponseStream<DummyProtocol> {
-        ResponseStream::new(Box::pin(stream::empty()), DummyProtocol)
+    fn create_test_stream()
+    -> ResponseStream<SseProtocol<impl Fn(&str, &str) -> Option<StreamEvent>>> {
+        ResponseStream::new(Box::pin(stream::empty()), create_test_protocol())
     }
 
     #[test]
@@ -362,6 +374,93 @@ mod tests {
         match stream.backlog.pop_front() {
             Some(ResponsePacket::Json(j)) => assert_eq!(j["b"], 2),
             _ => panic!("Expected json"),
+        }
+    }
+
+    #[test]
+    fn test_sse_line_parser() {
+        let input = "event: message\ndata: hello world\n";
+        let parsed = SseLineParser::parse(input);
+        assert_eq!(parsed.event_type, "message");
+        assert_eq!(parsed.data, "hello world");
+
+        let input = "data: just data\n";
+        let parsed = SseLineParser::parse(input);
+        assert_eq!(parsed.event_type, "");
+        assert_eq!(parsed.data, "just data");
+
+        let input = ": comment\nevent: ping\n";
+        let parsed = SseLineParser::parse(input);
+        assert_eq!(parsed.event_type, "ping");
+        assert_eq!(parsed.data, "");
+    }
+
+    #[test]
+    fn test_sse_protocol_decode() {
+        let mut protocol = create_test_protocol();
+        let mut buffer = BytesMut::from("event: message\ndata: hello\n\n");
+
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event {
+            assert_eq!(t, "hello");
+        } else {
+            panic!("Expected text");
+        }
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_sse_protocol_partial_decode() {
+        let mut protocol = create_test_protocol();
+        let mut buffer = BytesMut::from("event: message\ndata: hel");
+
+        // Should return None as no full event is present
+        assert!(protocol.decode(&mut buffer).unwrap().is_none());
+
+        // Append rest
+        buffer.extend_from_slice(b"lo\n\n");
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event {
+            assert_eq!(t, "hello");
+        } else {
+            panic!("Expected text");
+        }
+    }
+
+    #[test]
+    fn test_sse_protocol_multiple_events() {
+        let mut protocol = create_test_protocol();
+        let mut buffer =
+            BytesMut::from("event: message\ndata: one\n\nevent: message\ndata: two\n\n");
+
+        let event1 = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event1 {
+            assert_eq!(t, "one");
+        } else {
+            panic!("Expected text one");
+        }
+
+        let event2 = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event2 {
+            assert_eq!(t, "two");
+        } else {
+            panic!("Expected text two");
+        }
+
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_sse_protocol_usage() {
+        let mut protocol = create_test_protocol();
+        let mut buffer = BytesMut::from("event: usage\ndata: 10,20\n\n");
+
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Usage(u) = event {
+            assert_eq!(u.prompt_tokens, 10);
+            assert_eq!(u.completion_tokens, 20);
+        } else {
+            panic!("Expected usage");
         }
     }
 }

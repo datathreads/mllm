@@ -157,10 +157,11 @@ impl LlmProtocol for GeminiProtocol {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,no_run
+/// # use reqwest::Client;
+/// # use mllm::gemini::GeminiLlm;
 /// let client = Client::new();
-/// let gemini_api_key = std::env::var("GEMINI_API_KEY").unwrap();
-/// let llm = GeminiLlm::new(client, gemini_api_key, None);
+/// let llm = GeminiLlm::new(client, "api-key".to_string(), None);
 /// ```
 pub struct GeminiLlm {
     client: Client,
@@ -238,5 +239,62 @@ impl Llm for GeminiLlm {
             ResponseStream::new(Box::pin(response.bytes_stream()), GeminiProtocol::default());
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gemini_protocol_full_array() {
+        let mut protocol = GeminiProtocol::default();
+        let json = r#"[
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "Hello" }] } }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
+            }
+        ]"#;
+        let mut buffer = BytesMut::from(json);
+
+        // First decode should return text
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event {
+            assert_eq!(t, "Hello");
+        } else {
+            panic!("Expected text");
+        }
+
+        // Second decode should return usage (from pending_usage)
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Usage(u) = event {
+            assert_eq!(u.prompt_tokens, 10);
+            assert_eq!(u.completion_tokens, 5);
+        } else {
+            panic!("Expected usage");
+        }
+
+        assert!(protocol.decode(&mut buffer).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_gemini_protocol_fragmented() {
+        let mut protocol = GeminiProtocol::default();
+        let part1 = r#"[ { "candidates": [ { "content": { "parts": [ { "text": "Part1" "#;
+        let mut buffer = BytesMut::from(part1);
+
+        // Should return None due to EOF
+        assert!(protocol.decode(&mut buffer).unwrap().is_none());
+
+        // Append rest
+        let part2 = r#"} ] } } ] , "usageMetadata": { "promptTokenCount": 1 } } ]"#;
+        buffer.extend_from_slice(part2.as_bytes());
+
+        let event = protocol.decode(&mut buffer).unwrap().unwrap();
+        if let StreamEvent::Text(t) = event {
+            assert_eq!(t, "Part1");
+        } else {
+            panic!("Expected text");
+        }
     }
 }
